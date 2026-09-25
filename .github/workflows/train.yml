@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   train:
-    name: "seed ${{ matrix.seed }}"
+    name: "${{ inputs.config }} · seed ${{ matrix.seed }}"
     runs-on: ubuntu-latest
     # 6 h is the hard cap; stop at 5h50 so the artifact upload still runs.
     timeout-minutes: 350
@@ -43,6 +43,14 @@ jobs:
         seed: ${{ fromJSON(inputs.seeds) }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check the config exists
+        run: |
+          test -f "${{ inputs.config }}" || {
+            echo "::error::config not found: ${{ inputs.config }}"
+            echo "available:"; find configs -name '*.yml' | sort | sed 's/^/  /'
+            exit 1
+          }
 
       - name: Derive run slug
         id: slug
@@ -132,7 +140,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           jobs_json=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs" \
-                        --paginate -q '.jobs[] | select(.name|startswith("seed")) | "\(.name)|\(.conclusion)"')
+                        --paginate -q '.jobs[] | select(.name|contains("· seed")) | "\(.name)|\(.conclusion)"')
           ok=$(echo "$jobs_json" | grep -c 'success' || true)
           bad=$(echo "$jobs_json" | grep -vc 'success' || true)
 
