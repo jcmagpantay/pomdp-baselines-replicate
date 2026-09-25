@@ -61,17 +61,44 @@ jobs:
               --cuda -1 \
               ${{ inputs.extra_flags }}
 
-      - name: Collect results
+      - name: Summarize to job log
+        # Printed here, not only in the artifact, so an upload failure can never
+        # cost the run's headline numbers again.
         if: always()
         run: |
           cp -r stack logs/ 2>/dev/null || true
-          find logs -name progress.csv -exec sh -c 'echo "== $1"; wc -l "$1"' _ {} \;
+          for f in $(find logs -name progress.csv); do
+            echo "=== $f  ($(($(wc -l < "$f") - 1)) rows)"
+            python3 - "$f" <<'PYEOF'
+          import csv, sys
+          rows = list(csv.DictReader(open(sys.argv[1])))
+          if not rows:
+              print("  (no rows -- run did not reach the first eval)"); raise SystemExit
+          pick = [k for k in rows[0] if k.endswith("env_steps") or "return_eval_total" in k
+                  or k.endswith("time_cost") or k.endswith("fps") or k.endswith("rl_steps")]
+          print("  " + "  ".join(f"{k:>26s}" for k in pick))
+          for r in rows[:2] + (["..."] if len(rows) > 5 else []) + rows[-3:]:
+              if r == "...": print("  ..."); continue
+              print("  " + "  ".join(f"{r[k]:>26s}" for k in pick))
+          last = rows[-1]
+          t = float(last.get("z/time_cost", 0) or 0); n = float(last.get("z/rl_steps", 0) or 0)
+          if t and n:
+              print(f"\n  MEASURED: {n:,.0f} updates in {t:,.0f}s = {t/n*1000:.0f} ms/update"
+                    f"  ({t/3600:.2f} h wall)")
+          PYEOF
+          done
+
+      - name: Package logs
+        # tar because upload-artifact@v4 rejects ':' in paths, and
+        # utils/system.py:25 formats the log dir as "%m-%d:%H-%M:%S.%f".
+        if: always()
+        run: tar -czf "logs-seed${{ matrix.seed }}.tar.gz" logs/ 2>/dev/null || true
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: logs-seed${{ matrix.seed }}
-          path: logs/
+          path: logs-seed${{ matrix.seed }}.tar.gz
           retention-days: 90
           if-no-files-found: warn
