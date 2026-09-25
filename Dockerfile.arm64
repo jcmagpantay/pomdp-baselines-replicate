@@ -1,0 +1,24 @@
+# FAST (less faithful) variant: native arm64. torch 1.7.1 has no arm64 build, so
+# this drifts to 1.13.1 -- the earliest cp38 aarch64 wheel. Use for smoke tests
+# and speed work; use Dockerfile (amd64, torch 1.7.1) for numbers you intend to
+# report against the paper.
+# Non-slim base: ships gcc/g++, so pybullet and Box2D (no arm64 wheels exist
+# for any version) can compile without apt, whose bullseye pools now 404.
+FROM --platform=linux/arm64 python:3.8-bullseye
+
+RUN pip install --no-cache-dir pip==22.0.4 setuptools==65.5.0 wheel==0.38.4
+
+RUN pip install --no-cache-dir --only-binary=:all: torch==1.13.1
+
+RUN pip install --no-cache-dir --only-binary=:all: \
+      numpy==1.20.1 pillow==7.2.0 \
+      ruamel.yaml==0.16.12 absl-py==0.11.0 future-fstrings==1.2.0 \
+      tensorboard==2.8.0 tensorboardx==1.8 protobuf==3.19.4
+
+# These three have no arm64 wheels and must build from source.
+RUN pip install --no-cache-dir psutil==5.8.0 pybullet==3.1.8 box2d==2.3.10
+
+RUN pip install --no-cache-dir pycolab==1.2
+
+WORKDIR /workspace
+ENV PYTHONPATH=/workspace
