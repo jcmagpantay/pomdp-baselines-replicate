@@ -1,0 +1,77 @@
+# Runs a training config on GitHub-hosted runners (free + unlimited for public repos).
+#
+# Each seed is one job. Standard runners are native x86-64 with Docker preinstalled,
+# so the faithful image in ./Dockerfile runs unchanged -- exact torch 1.7.1 / gym
+# 0.21.0 pins, no gymnasium port. Runner hardware is amd64, so no emulation tax.
+#
+# HARD LIMIT: 6 h per job. CartPole-V (~2-3 h) fits. Pendulum-V (~11-17 h) does NOT
+# and needs --resume + chaining; see docs/runners.md.
+name: train
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "config yml, relative to repo root"
+        required: true
+        default: configs/pomdp/cartpole/v/rnn.yml
+      seeds:
+        description: "JSON list of seeds, e.g. [73] or [73,1,2,3,4]"
+        required: true
+        default: "[73]"
+      extra_flags:
+        description: 'extra CLI flags, e.g. "--algo sac"'
+        required: false
+        default: ""
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    # 6 h is the hard cap; stop at 5h50 so the artifact upload still runs.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ${{ fromJSON(inputs.seeds) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build replication image
+        run: docker build -t pomdp-repl .
+
+      - name: Record the stack that produced these numbers
+        run: |
+          mkdir -p stack
+          docker run --rm pomdp-repl pip freeze > stack/requirements.txt
+          docker run --rm pomdp-repl python -c \
+            "import torch,numpy,gym,platform;print(f'torch={torch.__version__} numpy={numpy.__version__} gym={gym.__version__} py={platform.python_version()} machine={platform.machine()}')" \
+            > stack/versions.txt
+          cat stack/versions.txt
+
+      - name: Train
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE":/workspace \
+            -e HOME=/tmp \
+            pomdp-repl \
+            python policies/main.py \
+              --cfg "${{ inputs.config }}" \
+              --seed ${{ matrix.seed }} \
+              --cuda -1 \
+              ${{ inputs.extra_flags }}
+
+      - name: Collect results
+        if: always()
+        run: |
+          cp -r stack logs/ 2>/dev/null || true
+          find logs -name progress.csv -exec sh -c 'echo "== $1"; wc -l "$1"' _ {} \;
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-seed${{ matrix.seed }}
+          path: logs/
+          retention-days: 90
+          if-no-files-found: warn
