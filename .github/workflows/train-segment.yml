@@ -88,7 +88,13 @@ jobs:
       - name: Mark complete or report handover
         if: steps.plan.outputs.state != 'done'
         run: |
-          D=$(find logs -name checkpoint.pt -printf '%h\n' | head -1)
+          D=$(find logs -name checkpoint.pt -printf '%h\n' 2>/dev/null | head -1 || true)
+          if [ -z "$D" ]; then
+            echo "::warning::No checkpoint written in this segment, so the next one \
+          starts over. Either the segment was shorter than the initial update burst, or \
+          ckpt_minutes is too large relative to train_timeout_minutes."
+            exit 0
+          fi
           if [ "${{ steps.train.outcome }}" = "success" ]; then
             touch "$D/DONE"
             echo "::notice::Run COMPLETE for seed ${{ matrix.seed }}."

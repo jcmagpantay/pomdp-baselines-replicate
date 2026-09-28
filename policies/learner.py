@@ -405,6 +405,11 @@ class Learner:
                 )
                 self.log_train_stats(train_stats)
 
+            # Checkpoint as soon as the initial burst is done: it is long enough
+            # (~1000 updates) that a segment ending inside it would otherwise
+            # hand over nothing and force the next segment to start over.
+            self._maybe_checkpoint(last_eval_num_iters, force=True)
+
         current_num_iters = last_eval_num_iters
         while self._n_env_steps_total < self.n_env_steps_total:
             # collect data from num_rollouts_per_iter train tasks:
