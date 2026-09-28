@@ -24,6 +24,7 @@ from utils import helpers as utl
 from torchkit import pytorch_utils as ptu
 from utils import evaluation as utl_eval
 from utils import logger
+from utils import checkpoint as ckpt
 
 
 class Learner:
@@ -342,14 +343,45 @@ class Learner:
         self._start_time = time.time()
         self._start_time_last = time.time()
 
+    def _elapsed_seconds(self):
+        return time.time() - self._start_time
+
+    def _restore_elapsed(self, elapsed):
+        """Backdate the clock so z/time_cost keeps counting across segments."""
+        self._start_time = time.time() - elapsed
+        self._start_time_last = time.time()
+
+    def configure_checkpointing(self, path, every_minutes=20.0, resume=False):
+        self._ckpt_path = path
+        self._ckpt_every = float(every_minutes) * 60.0
+        self._resume = bool(resume)
+
+    def _maybe_checkpoint(self, last_eval_num_iters, force=False):
+        if not getattr(self, "_ckpt_path", None):
+            return
+        if self._ckpt_every <= 0 and not force:
+            return  # --ckpt_minutes 0 disables periodic checkpointing
+        now = time.time()
+        if force or now - getattr(self, "_ckpt_last", 0.0) >= self._ckpt_every:
+            ckpt.save(self, self._ckpt_path, last_eval_num_iters)
+            self._ckpt_last = now
+            logger.log(f"checkpoint written: env_steps {self._n_env_steps_total}")
+
     def train(self):
         """
         training loop
         """
 
+        resuming = getattr(self, "_resume", False)
         self._start_training()
+        last_eval_num_iters = 0
+        if resuming:
+            # restores counters, buffer, optimizers and every RNG stream, so the
+            # continuation is bitwise identical to an uninterrupted run
+            last_eval_num_iters = ckpt.load(self, self._ckpt_path)
+        self._ckpt_last = time.time()
 
-        if self.num_init_rollouts_pool > 0:
+        if self.num_init_rollouts_pool > 0 and not resuming:
             logger.log("Collecting initial pool of data..")
             while (
                 self._n_env_steps_total
@@ -373,7 +405,7 @@ class Learner:
                 )
                 self.log_train_stats(train_stats)
 
-        last_eval_num_iters = 0
+        current_num_iters = last_eval_num_iters
         while self._n_env_steps_total < self.n_env_steps_total:
             # collect data from num_rollouts_per_iter train tasks:
             env_steps = self.collect_rollouts(num_rollouts=self.num_rollouts_per_iter)
@@ -403,6 +435,10 @@ class Learner:
                 ):
                     # save models in later training stage
                     self.save_model(current_num_iters, perf)
+
+            self._maybe_checkpoint(last_eval_num_iters)
+
+        self._maybe_checkpoint(last_eval_num_iters, force=True)
         self.save_model(current_num_iters, perf)
 
     @torch.no_grad()

@@ -32,6 +32,14 @@ flags.DEFINE_boolean(
 )
 flags.DEFINE_boolean("debug", False, "debug mode")
 
+# Resume: every free compute tier caps session length (6 h GitHub Actions, 12 h
+# Kaggle). --resume continues a run in its ORIGINAL log dir so progress.csv keeps
+# one continuous curve. The seed must match the checkpoint's.
+flags.DEFINE_string("resume", None, "log dir of a previous run to continue")
+flags.DEFINE_float(
+    "ckpt_minutes", 20.0, "wall-clock minutes between checkpoints; 0 disables"
+)
+
 flags.FLAGS(sys.argv)
 yaml = YAML()
 v = yaml.load(open(FLAGS.cfg))
@@ -137,20 +145,39 @@ if seq_model != "mlp":
         policy_input_str += "r"
     exp_id += policy_input_str + "/"
 
-os.makedirs(exp_id, exist_ok=True)
-log_folder = os.path.join(exp_id, system.now_str())
+resuming = FLAGS.resume is not None
+if resuming:
+    log_folder = FLAGS.resume
+    assert os.path.isdir(log_folder), f"--resume dir not found: {log_folder}"
+else:
+    os.makedirs(exp_id, exist_ok=True)
+    log_folder = os.path.join(exp_id, system.now_str())
+if resuming:
+    # drop any progress.csv rows written after the last checkpoint, else the
+    # resumed segment appends duplicates of steps it is about to redo
+    from utils import checkpoint as _ckpt
+
+    _dropped = _ckpt.truncate_csv(os.path.join(log_folder, "checkpoint.pt"))
+    if _dropped:
+        print(f"resume: dropped {_dropped} progress.csv row(s) past the checkpoint")
+
 logger_formats = ["stdout", "log", "csv"]
 if v["eval"]["log_tensorboard"]:
     logger_formats.append("tensorboard")
-logger.configure(dir=log_folder, format_strs=logger_formats, precision=4)
+# append=True keeps the earlier segment's rows: the CSV writer would otherwise
+# truncate them, leaving only the final segment of the curve.
+logger.configure(
+    dir=log_folder, format_strs=logger_formats, precision=4, append=resuming
+)
 logger.log(f"preload cost {time.time() - t0:.2f}s")
 
-os.system(f"cp -r policies/ {log_folder}")
+if not resuming:
+    os.system(f"cp -r policies/ {log_folder}")
 yaml.dump(v, Path(f"{log_folder}/variant_{pid}.yml"))
 key_flags = FLAGS.get_key_flags_for_module(sys.argv[0])
 logger.log("\n".join(f.serialize() for f in key_flags) + "\n")
 logger.log("pid", pid, socket.gethostname())
-os.makedirs(os.path.join(logger.get_dir(), "save"))
+os.makedirs(os.path.join(logger.get_dir(), "save"), exist_ok=True)
 
 
 # start training
@@ -164,6 +191,13 @@ learner = Learner(
 
 logger.log(
     f"total RAM usage: {psutil.Process().memory_info().rss / 1024 ** 3 :.2f} GB\n"
+)
+
+ckpt_path = os.path.join(log_folder, "checkpoint.pt")
+if resuming:
+    assert os.path.isfile(ckpt_path), f"no checkpoint.pt in {log_folder}"
+learner.configure_checkpointing(
+    ckpt_path, every_minutes=FLAGS.ckpt_minutes, resume=resuming
 )
 
 learner.train()

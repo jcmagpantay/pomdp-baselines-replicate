@@ -61,9 +61,9 @@ def put_in_middle(str1, str2):
 
 
 class HumanOutputFormat(KVWriter, SeqWriter):
-    def __init__(self, filename_or_file):
+    def __init__(self, filename_or_file, append=False):
         if isinstance(filename_or_file, str):
-            self.file = open(filename_or_file, "wt")
+            self.file = open(filename_or_file, "at" if append else "wt")
             self.own_file = True
         else:
             assert hasattr(filename_or_file, "read"), (
@@ -144,10 +144,19 @@ class JSONOutputFormat(KVWriter):
 
 
 class CSVOutputFormat(KVWriter):
-    def __init__(self, filename):
-        self.file = open(filename, "w+t")
-        self.keys = []
+    def __init__(self, filename, append=False):
         self.sep = ","
+        self.keys = []
+        if append and osp.exists(filename) and osp.getsize(filename) > 0:
+            # Resuming into an existing run: "w+t" would truncate every row the
+            # earlier segment wrote. Adopt the existing column order and append.
+            self.file = open(filename, "r+t")
+            header = self.file.readline().rstrip("\n")
+            if header:
+                self.keys = header.split(self.sep)
+            self.file.seek(0, os.SEEK_END)
+        else:
+            self.file = open(filename, "w+t")
 
     def writekvs(self, kvs):
         # Add our current row to the history
@@ -207,16 +216,18 @@ class TensorBoardOutputFormat(KVWriter):
             self.writer = None
 
 
-def make_output_format(format, ev_dir, log_suffix=""):
+def make_output_format(format, ev_dir, log_suffix="", append=False):
     os.makedirs(ev_dir, exist_ok=True)
     if format == "stdout":
         return HumanOutputFormat(sys.stdout)
     elif format == "log":
-        return HumanOutputFormat(osp.join(ev_dir, "experiment%s.log" % log_suffix))
+        return HumanOutputFormat(
+            osp.join(ev_dir, "experiment%s.log" % log_suffix), append=append
+        )
     elif format == "json":
         return JSONOutputFormat(osp.join(ev_dir, "progress.json"))
     elif format == "csv":
-        return CSVOutputFormat(osp.join(ev_dir, "progress.csv"))
+        return CSVOutputFormat(osp.join(ev_dir, "progress.csv"), append=append)
     elif format == "tensorboard":
         return TensorBoardOutputFormat(ev_dir)
     else:
@@ -429,7 +440,7 @@ Logger.DEFAULT = Logger.CURRENT = Logger(
 )
 
 
-def configure(dir=None, format_strs=None, log_suffix="", precision=None):
+def configure(dir=None, format_strs=None, log_suffix="", precision=None, append=False):
     if dir is None:
         dir = os.getenv("OPENAI_LOGDIR")
     if dir is None:
@@ -443,7 +454,9 @@ def configure(dir=None, format_strs=None, log_suffix="", precision=None):
     if format_strs is None:
         strs = os.getenv("OPENAI_LOG_FORMAT")
         format_strs = strs.split(",") if strs else LOG_OUTPUT_FORMATS
-    output_formats = [make_output_format(f, dir, log_suffix) for f in format_strs]
+    output_formats = [
+        make_output_format(f, dir, log_suffix, append=append) for f in format_strs
+    ]
 
     Logger.CURRENT = Logger(dir=dir, output_formats=output_formats, precision=precision)
     log("Logging to %s" % dir)
