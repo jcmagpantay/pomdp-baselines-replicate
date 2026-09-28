@@ -1,14 +1,13 @@
-# Runs a training config on GitHub-hosted runners (free + unlimited for public repos).
+# Dispatch a training batch. One job per seed per segment.
 #
-# Each seed is one job. Standard runners are native x86-64 with Docker preinstalled,
-# so the faithful image in ./Dockerfile runs unchanged -- exact torch 1.7.1 / gym
-# 0.21.0 pins, no gymnasium port. Runner hardware is amd64, so no emulation tax.
+# A job is capped at 6 h. Runs that need longer are chained across sequential
+# segments that hand a checkpoint over through the Actions cache; a segment whose
+# predecessor already finished short-circuits in seconds.
 #
-# HARD LIMIT: 6 h per job. CartPole-V (~2-3 h) fits. Pendulum-V (~11-17 h) does NOT
-# and needs --resume + chaining; see docs/runners.md.
+#   CartPole-V  ~1 h   -> 1 segment
+#   Pendulum-V  6.5-14.7 h (runner speed varies ~2x) -> 3 segments
 name: train
 
-# Shows the config + seeds in the run list instead of just "train".
 run-name: "${{ inputs.config }} · seeds ${{ inputs.seeds }}"
 
 on:
@@ -26,113 +25,73 @@ on:
         description: 'extra CLI flags, e.g. "--algo sac"'
         required: false
         default: ""
+      segments:
+        description: "chain length (1-4). Pendulum-V needs 3; CartPole-V needs 1"
+        required: false
+        default: "1"
+      train_timeout_minutes:
+        description: "per-segment training cap. 320 in production; set small to test chaining"
+        required: false
+        default: "320"
+      ckpt_minutes:
+        description: "minutes between checkpoints. Must be well under train_timeout_minutes, since a timed-out step is killed and only periodic checkpoints survive"
+        required: false
+        default: "20"
 
 permissions:
   contents: read
-  issues: write          # the summary job opens an issue per batch
+  issues: write
 
 jobs:
-  train:
-    name: "${{ inputs.config }} · seed ${{ matrix.seed }}"
-    runs-on: ubuntu-latest
-    # 6 h is the hard cap; stop at 5h50 so the artifact upload still runs.
-    timeout-minutes: 350
-    strategy:
-      fail-fast: false
-      matrix:
-        seed: ${{ fromJSON(inputs.seeds) }}
-    steps:
-      - uses: actions/checkout@v4
+  seg1:
+    uses: ./.github/workflows/train-segment.yml
+    with:
+      config: ${{ inputs.config }}
+      seeds: ${{ inputs.seeds }}
+      extra_flags: ${{ inputs.extra_flags }}
+      segment: 1
+      train_timeout_minutes: ${{ fromJSON(inputs.train_timeout_minutes) }}
+      ckpt_minutes: ${{ fromJSON(inputs.ckpt_minutes) }}
 
-      - name: Check the config exists
-        run: |
-          test -f "${{ inputs.config }}" || {
-            echo "::error::config not found: ${{ inputs.config }}"
-            echo "available:"; find configs -name '*.yml' | sort | sed 's/^/  /'
-            exit 1
-          }
+  seg2:
+    needs: seg1
+    if: always() && fromJSON(inputs.segments) >= 2
+    uses: ./.github/workflows/train-segment.yml
+    with:
+      config: ${{ inputs.config }}
+      seeds: ${{ inputs.seeds }}
+      extra_flags: ${{ inputs.extra_flags }}
+      segment: 2
+      train_timeout_minutes: ${{ fromJSON(inputs.train_timeout_minutes) }}
+      ckpt_minutes: ${{ fromJSON(inputs.ckpt_minutes) }}
 
-      - name: Derive run slug
-        id: slug
-        # configs/pomdp/pendulum/v/rnn.yml -> pomdp-pendulum-v-rnn
-        run: |
-          echo "slug=$(echo '${{ inputs.config }}' \
-            | sed 's#^configs/##; s#\.yml$##; s#/#-#g')" >> "$GITHUB_OUTPUT"
+  seg3:
+    needs: seg2
+    if: always() && fromJSON(inputs.segments) >= 3
+    uses: ./.github/workflows/train-segment.yml
+    with:
+      config: ${{ inputs.config }}
+      seeds: ${{ inputs.seeds }}
+      extra_flags: ${{ inputs.extra_flags }}
+      segment: 3
+      train_timeout_minutes: ${{ fromJSON(inputs.train_timeout_minutes) }}
+      ckpt_minutes: ${{ fromJSON(inputs.ckpt_minutes) }}
 
-      - name: Build replication image
-        run: docker build -t pomdp-repl .
-
-      - name: Record the stack that produced these numbers
-        run: |
-          mkdir -p stack
-          docker run --rm pomdp-repl pip freeze > stack/requirements.txt
-          docker run --rm pomdp-repl python -c \
-            "import torch,numpy,gym,platform;print(f'torch={torch.__version__} numpy={numpy.__version__} gym={gym.__version__} py={platform.python_version()} machine={platform.machine()}')" \
-            > stack/versions.txt
-          cat stack/versions.txt
-
-      - name: Train
-        # Step-level, not job-level: a job timeout can cancel the save steps.
-        # Bounding the step lets it fail while tar/upload still run.
-        timeout-minutes: 320
-        run: |
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -v "$GITHUB_WORKSPACE":/workspace \
-            -e HOME=/tmp \
-            pomdp-repl \
-            python policies/main.py \
-              --cfg "${{ inputs.config }}" \
-              --seed ${{ matrix.seed }} \
-              --cuda -1 \
-              ${{ inputs.extra_flags }}
-
-      - name: Summarize to job log
-        # Printed here, not only in the artifact, so an upload failure can never
-        # cost the run's headline numbers again.
-        if: always()
-        run: |
-          cp -r stack logs/ 2>/dev/null || true
-          for f in $(find logs -name progress.csv); do
-            echo "=== $f  ($(($(wc -l < "$f") - 1)) rows)"
-            python3 - "$f" <<'PYEOF'
-          import csv, sys
-          rows = list(csv.DictReader(open(sys.argv[1])))
-          if not rows:
-              print("  (no rows -- run did not reach the first eval)"); raise SystemExit
-          pick = [k for k in rows[0] if k.endswith("env_steps") or "return_eval_total" in k
-                  or k.endswith("time_cost") or k.endswith("fps") or k.endswith("rl_steps")]
-          print("  " + "  ".join(f"{k:>26s}" for k in pick))
-          for r in rows[:2] + (["..."] if len(rows) > 5 else []) + rows[-3:]:
-              if r == "...": print("  ..."); continue
-              print("  " + "  ".join(f"{r[k]:>26s}" for k in pick))
-          last = rows[-1]
-          t = float(last.get("z/time_cost", 0) or 0); n = float(last.get("z/rl_steps", 0) or 0)
-          if t and n:
-              print(f"\n  MEASURED: {n:,.0f} updates in {t:,.0f}s = {t/n*1000:.0f} ms/update"
-                    f"  ({t/3600:.2f} h wall)")
-          PYEOF
-          done
-
-      - name: Package logs
-        # tar because upload-artifact@v4 rejects ':' in paths, and
-        # utils/system.py:25 formats the log dir as "%m-%d:%H-%M:%S.%f".
-        if: always()
-        run: tar -czf "logs-${{ steps.slug.outputs.slug }}-seed${{ matrix.seed }}.tar.gz" logs/ 2>/dev/null || true
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-${{ steps.slug.outputs.slug }}-seed${{ matrix.seed }}
-          path: logs-${{ steps.slug.outputs.slug }}-seed${{ matrix.seed }}.tar.gz
-          retention-days: 90
-          if-no-files-found: warn
+  seg4:
+    needs: seg3
+    if: always() && fromJSON(inputs.segments) >= 4
+    uses: ./.github/workflows/train-segment.yml
+    with:
+      config: ${{ inputs.config }}
+      seeds: ${{ inputs.seeds }}
+      extra_flags: ${{ inputs.extra_flags }}
+      segment: 4
+      train_timeout_minutes: ${{ fromJSON(inputs.train_timeout_minutes) }}
+      ckpt_minutes: ${{ fromJSON(inputs.ckpt_minutes) }}
 
   summary:
-    # Runs once after every seed finishes, pass or fail.
     name: batch summary
-    needs: train
+    needs: [seg1, seg2, seg3, seg4]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -149,8 +108,12 @@ jobs:
           bad=$(printf '%s\n' "$jobs_txt" | grep -vc 'success' || true)
           {
             echo "**Config:** \`${{ inputs.config }}\`"
-            echo "**Seeds:** \`${{ inputs.seeds }}\`"
-            echo "**Result:** $ok succeeded, $bad did not"
+            echo "**Seeds:** \`${{ inputs.seeds }}\`  ·  **Segments:** \`${{ inputs.segments }}\`"
+            echo "**Jobs:** $ok succeeded, $bad did not"
+            echo
+            echo "A segment that times out is expected: it saves a checkpoint and the"
+            echo "next segment resumes from it. Look for the COMPLETE notice to know a"
+            echo "seed actually finished."
             echo
             echo "| job | conclusion |"
             echo "|---|---|"
@@ -160,13 +123,9 @@ jobs:
           } > body.md
           echo "ok=$ok"  >> "$GITHUB_OUTPUT"
           echo "bad=$bad" >> "$GITHUB_OUTPUT"
-          # Always render on the run page -- this needs no repo features enabled.
           cat body.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Open batch summary issue
-        # Best-effort: forks have Issues DISABLED by default, so this is expected
-        # to fail until they are switched on (Settings -> General -> Features).
-        # continue-on-error is explicit; do not mask the exit code with a pipe.
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -178,7 +137,5 @@ jobs:
                --label "training-run"; then
             echo "issue created"
           else
-            echo "::warning::Could not create the summary issue. Issues are disabled \
-          on this repository (forks default to off). The report is on the run summary page. \
-          Enable with: gh repo edit --enable-issues"
+            echo "::warning::Could not create the summary issue; the report is on the run summary page."
           fi

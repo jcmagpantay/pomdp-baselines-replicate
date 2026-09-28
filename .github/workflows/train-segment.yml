@@ -1,0 +1,129 @@
+# One segment of a (possibly chained) training run.
+#
+# A GitHub job is capped at 6 h, and Pendulum-V needs 6.5-14.7 h. So a run is
+# split across several sequential jobs: each restores the previous segment's
+# checkpoint from the Actions cache, trains until its step timeout, writes a
+# checkpoint, and hands over. utils/checkpoint.py makes the continuation
+# bitwise-identical to an uninterrupted run.
+#
+# Segments are chained with `needs:` inside ONE workflow run rather than by
+# re-dispatching: workflows triggered by GITHUB_TOKEN cannot start new workflow
+# runs, and a run may last up to 35 days.
+name: train-segment
+
+on:
+  workflow_call:
+    inputs:
+      config:      { required: true,  type: string }
+      seeds:       { required: true,  type: string }
+      extra_flags: { required: false, type: string, default: "" }
+      segment:     { required: true,  type: number }
+      train_timeout_minutes: { required: false, type: number, default: 320 }
+      ckpt_minutes:          { required: false, type: number, default: 20 }
+
+jobs:
+  segment:
+    name: "seg${{ inputs.segment }} · ${{ inputs.config }} · seed ${{ matrix.seed }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ${{ fromJSON(inputs.seeds) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive run slug
+        id: slug
+        run: |
+          echo "slug=$(echo '${{ inputs.config }}' \
+            | sed 's#^configs/##; s#\.yml$##; s#/#-#g')" >> "$GITHUB_OUTPUT"
+
+      # Restore this run's previous segment. restore-keys does prefix matching and
+      # returns the most recent hit, so segment N picks up segment N-1.
+      - name: Restore checkpoint
+        uses: actions/cache/restore@v4
+        with:
+          path: logs
+          key: ckpt-${{ steps.slug.outputs.slug }}-s${{ matrix.seed }}-${{ github.run_id }}-seg${{ inputs.segment }}
+          restore-keys: |
+            ckpt-${{ steps.slug.outputs.slug }}-s${{ matrix.seed }}-${{ github.run_id }}-
+
+      - name: Decide start or resume
+        id: plan
+        run: |
+          D=$(find logs -name checkpoint.pt -printf '%h\n' 2>/dev/null | head -1 || true)
+          if [ -n "$D" ] && [ -f "$D/DONE" ]; then
+            echo "state=done" >> "$GITHUB_OUTPUT"
+            echo "Run already finished in an earlier segment; nothing to do."
+          elif [ -n "$D" ]; then
+            echo "state=resume" >> "$GITHUB_OUTPUT"
+            echo "dir=$D" >> "$GITHUB_OUTPUT"
+            echo "Resuming from $D"
+          else
+            echo "state=fresh" >> "$GITHUB_OUTPUT"
+            echo "No checkpoint found; starting a fresh run."
+          fi
+
+      - name: Build replication image
+        if: steps.plan.outputs.state != 'done'
+        run: docker build -t pomdp-repl .
+
+      - name: Train
+        id: train
+        if: steps.plan.outputs.state != 'done'
+        # Step-level timeout so the cache-save and upload steps below still run.
+        timeout-minutes: ${{ inputs.train_timeout_minutes }}
+        continue-on-error: true
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE":/workspace -e HOME=/tmp pomdp-repl \
+            python policies/main.py \
+              --cfg "${{ inputs.config }}" \
+              --seed ${{ matrix.seed }} --cuda -1 \
+              --ckpt_minutes ${{ inputs.ckpt_minutes }} \
+              ${{ steps.plan.outputs.state == 'resume' && format('--resume {0}', steps.plan.outputs.dir) || '' }} \
+              ${{ inputs.extra_flags }}
+
+      - name: Mark complete or report handover
+        if: steps.plan.outputs.state != 'done'
+        run: |
+          D=$(find logs -name checkpoint.pt -printf '%h\n' | head -1)
+          if [ "${{ steps.train.outcome }}" = "success" ]; then
+            touch "$D/DONE"
+            echo "::notice::Run COMPLETE for seed ${{ matrix.seed }}."
+          else
+            echo "::notice::Segment ${{ inputs.segment }} hit its timeout; \
+          checkpoint saved, the next segment will continue from it."
+          fi
+          python3 - "$D/progress.csv" <<'PYEOF'
+          import csv, sys
+          rows=list(csv.DictReader(open(sys.argv[1])))
+          if not rows: print("no rows yet"); raise SystemExit
+          def last(k):
+              for r in reversed(rows):
+                  if r.get(k): return r[k]
+              return "-"
+          print(f"rows={len(rows)} env_steps={last('z/env_steps')} "
+                f"rl_steps={last('z/rl_steps')} return={last('metrics/return_eval_total')}")
+          PYEOF
+
+      - name: Save checkpoint for the next segment
+        if: always() && steps.plan.outputs.state != 'done'
+        uses: actions/cache/save@v4
+        with:
+          path: logs
+          key: ckpt-${{ steps.slug.outputs.slug }}-s${{ matrix.seed }}-${{ github.run_id }}-seg${{ inputs.segment }}
+
+      - name: Package logs
+        if: always()
+        run: tar -czf "logs-${{ steps.slug.outputs.slug }}-seed${{ matrix.seed }}-seg${{ inputs.segment }}.tar.gz" logs/ 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ steps.slug.outputs.slug }}-seed${{ matrix.seed }}-seg${{ inputs.segment }}
+          path: logs-${{ steps.slug.outputs.slug }}-seed${{ matrix.seed }}-seg${{ inputs.segment }}.tar.gz
+          retention-days: 90
+          if-no-files-found: warn
