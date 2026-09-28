@@ -442,6 +442,16 @@ The last row is what buys *validity* rather than mere continuity. All of it is
 serializable, so bitwise resume is achievable for vector-observation envs. Checkpoint size
 is small — Pendulum-V is ~1.2 MB (51,000 used rows x 6 fields x 4 bytes).
 
+**Segment length constraint (CI chaining).** `train()` performs an initial update
+burst -- `num_init_rollouts_pool * max_trajectory_len * num_updates_per_iter`
+updates, ~1000 for CartPole-V and Pendulum-V -- as one atomic block *before* its
+main loop. At the 600-1060 ms/update measured on GitHub runners that is ~16 min.
+Checkpoints are only taken at loop boundaries, because a mid-burst checkpoint is
+not a resumable point and would break bitwise-exactness. So **a chained segment
+must be longer than the burst**, or it hands over nothing and the next segment
+restarts from zero. The production `train_timeout_minutes: 320` clears it by ~20x;
+short test segments do not.
+
 Implementation notes:
 
 - **Atomic writes.** Write `ckpt.tmp`, then `os.replace()`. A kill mid-write leaves the

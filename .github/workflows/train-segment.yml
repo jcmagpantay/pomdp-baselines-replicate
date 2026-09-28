@@ -9,6 +9,16 @@
 # Segments are chained with `needs:` inside ONE workflow run rather than by
 # re-dispatching: workflows triggered by GITHUB_TOKEN cannot start new workflow
 # runs, and a run may last up to 35 days.
+#
+# CONSTRAINT: train_timeout_minutes must exceed the initial update burst, which
+# train() runs as one atomic block before its main loop:
+#     num_init_rollouts_pool * max_trajectory_len * num_updates_per_iter updates
+# ~1000 updates for CartPole-V and Pendulum-V, i.e. ~16 min at the 600-1060
+# ms/update observed on standard runners. Checkpoints are only taken at loop
+# boundaries -- a mid-burst checkpoint is not a resumable point, so the run would
+# stop being bitwise-exact -- which means a segment shorter than the burst hands
+# over nothing and the next one starts from zero. The production default of 320
+# clears it by ~20x.
 name: train-segment
 
 on:
