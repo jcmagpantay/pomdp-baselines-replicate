@@ -72,6 +72,9 @@ jobs:
           cat stack/versions.txt
 
       - name: Train
+        # Step-level, not job-level: a job timeout can cancel the save steps.
+        # Bounding the step lets it fail while tar/upload still run.
+        timeout-minutes: 320
         run: |
           docker run --rm \
             --user "$(id -u):$(id -g)" \
@@ -127,23 +130,23 @@ jobs:
           if-no-files-found: warn
 
   summary:
-    # Runs once after every seed finishes, pass or fail. Opens an issue assigned
-    # to whoever dispatched the batch -- assignment is what triggers the email.
+    # Runs once after every seed finishes, pass or fail.
     name: batch summary
     needs: train
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Open batch summary issue
+      - name: Build batch report
+        id: report
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ github.run_id }}
         run: |
-          jobs_json=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs" \
-                        --paginate -q '.jobs[] | select(.name|contains("· seed")) | "\(.name)|\(.conclusion)"')
-          ok=$(echo "$jobs_json" | grep -c 'success' || true)
-          bad=$(echo "$jobs_json" | grep -vc 'success' || true)
-
+          set -euo pipefail
+          jobs_txt=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs" \
+                       --paginate -q '.jobs[] | select(.name|contains("· seed")) | "\(.name)|\(.conclusion)"')
+          ok=$(printf '%s\n' "$jobs_txt" | grep -c 'success' || true)
+          bad=$(printf '%s\n' "$jobs_txt" | grep -vc 'success' || true)
           {
             echo "**Config:** \`${{ inputs.config }}\`"
             echo "**Seeds:** \`${{ inputs.seeds }}\`"
@@ -151,16 +154,31 @@ jobs:
             echo
             echo "| job | conclusion |"
             echo "|---|---|"
-            echo "$jobs_json" | awk -F'|' 'NF{print "| "$1" | "$2" |"}'
+            printf '%s\n' "$jobs_txt" | awk -F'|' 'NF{print "| "$1" | "$2" |"}'
             echo
             echo "[Full logs and artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/$RUN_ID)"
-            echo
-            echo "Per-seed \`ms/update\` and final \`return_eval_total\` are in each job's"
-            echo "\"Summarize to job log\" step. Artifacts are \`logs-*.tar.gz\`."
           } > body.md
+          echo "ok=$ok"  >> "$GITHUB_OUTPUT"
+          echo "bad=$bad" >> "$GITHUB_OUTPUT"
+          # Always render on the run page -- this needs no repo features enabled.
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
 
-          gh issue create \
-            --title "run: ${{ inputs.config }} · seeds ${{ inputs.seeds }} · $ok ok / $bad failed" \
-            --body-file body.md \
-            --assignee "${{ github.actor }}" \
-            --label "training-run" 2>&1 | tail -2
+      - name: Open batch summary issue
+        # Best-effort: forks have Issues DISABLED by default, so this is expected
+        # to fail until they are switched on (Settings -> General -> Features).
+        # continue-on-error is explicit; do not mask the exit code with a pipe.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh issue create \
+               --title "run: ${{ inputs.config }} · seeds ${{ inputs.seeds }} · ${{ steps.report.outputs.ok }} ok / ${{ steps.report.outputs.bad }} failed" \
+               --body-file body.md \
+               --assignee "${{ github.actor }}" \
+               --label "training-run"; then
+            echo "issue created"
+          else
+            echo "::warning::Could not create the summary issue. Issues are disabled \
+          on this repository (forks default to off). The report is on the run summary page. \
+          Enable with: gh repo edit --enable-issues"
+          fi
