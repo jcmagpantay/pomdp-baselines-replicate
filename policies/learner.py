@@ -411,6 +411,10 @@ class Learner:
             self._maybe_checkpoint(last_eval_num_iters, force=True)
 
         current_num_iters = last_eval_num_iters
+        # perf is only assigned inside the eval branch below. A resumed segment
+        # whose work is already finished never enters the loop, so without this
+        # the final save_model raises UnboundLocalError.
+        perf = None
         while self._n_env_steps_total < self.n_env_steps_total:
             # collect data from num_rollouts_per_iter train tasks:
             env_steps = self.collect_rollouts(num_rollouts=self.num_rollouts_per_iter)
@@ -444,7 +448,8 @@ class Learner:
             self._maybe_checkpoint(last_eval_num_iters)
 
         self._maybe_checkpoint(last_eval_num_iters, force=True)
-        self.save_model(current_num_iters, perf)
+        if perf is not None:
+            self.save_model(current_num_iters, perf)
 
     @torch.no_grad()
     def collect_rollouts(self, num_rollouts, random_actions=False):

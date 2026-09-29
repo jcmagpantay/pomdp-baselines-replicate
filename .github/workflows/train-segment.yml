@@ -82,36 +82,61 @@ jobs:
       - name: Train
         id: train
         if: steps.plan.outputs.state != 'done'
-        # Step-level timeout so the cache-save and upload steps below still run.
-        timeout-minutes: ${{ inputs.train_timeout_minutes }}
+        # The INNER `timeout` fires first so its exit code distinguishes a timeout
+        # (124: expected, hand over) from a crash (anything else: must fail loudly).
+        # Relying on the step timeout alone made a crashed run look identical to a
+        # timed-out one, and the job went green having trained nothing.
+        timeout-minutes: ${{ inputs.train_timeout_minutes + 10 }}
         continue-on-error: true
         run: |
-          docker run --rm --user "$(id -u):$(id -g)" \
-            -v "$GITHUB_WORKSPACE":/workspace -e HOME=/tmp pomdp-repl \
-            python policies/main.py \
-              --cfg "${{ inputs.config }}" \
-              --seed ${{ matrix.seed }} --cuda -1 \
-              --ckpt_minutes ${{ inputs.ckpt_minutes }} \
-              ${{ steps.plan.outputs.state == 'resume' && format('--resume {0}', steps.plan.outputs.dir) || '' }} \
-              ${{ inputs.extra_flags }}
+          set +e
+          timeout $(( ${{ inputs.train_timeout_minutes }} * 60 )) \
+            docker run --rm --user "$(id -u):$(id -g)" \
+              -v "$GITHUB_WORKSPACE":/workspace -e HOME=/tmp pomdp-repl \
+              python policies/main.py \
+                --cfg "${{ inputs.config }}" \
+                --seed ${{ matrix.seed }} --cuda -1 \
+                --ckpt_minutes ${{ inputs.ckpt_minutes }} \
+                ${{ steps.plan.outputs.state == 'resume' && format('--resume {0}', steps.plan.outputs.dir) || '' }} \
+                ${{ inputs.extra_flags }}
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if   [ $code -eq 0   ]; then echo "result=complete" >> "$GITHUB_OUTPUT"
+          elif [ $code -eq 124 ]; then echo "result=timeout"  >> "$GITHUB_OUTPUT"
+          else                         echo "result=crash"    >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
 
-      - name: Mark complete or report handover
+      - name: Classify outcome
         if: steps.plan.outputs.state != 'done'
         run: |
           D=$(find logs -name checkpoint.pt -printf '%h\n' 2>/dev/null | head -1 || true)
-          if [ -z "$D" ]; then
-            echo "::warning::No checkpoint written in this segment, so the next one \
-          starts over. Either the segment was shorter than the initial update burst, or \
-          ckpt_minutes is too large relative to train_timeout_minutes."
-            exit 0
-          fi
-          if [ "${{ steps.train.outcome }}" = "success" ]; then
-            touch "$D/DONE"
-            echo "::notice::Run COMPLETE for seed ${{ matrix.seed }}."
-          else
-            echo "::notice::Segment ${{ inputs.segment }} hit its timeout; \
-          checkpoint saved, the next segment will continue from it."
-          fi
+          case "${{ steps.train.outputs.result }}" in
+            complete)
+              [ -n "$D" ] && touch "$D/DONE"
+              echo "::notice::Run COMPLETE for seed ${{ matrix.seed }}."
+              ;;
+            timeout)
+              if [ -z "$D" ]; then
+                echo "::error::Timed out with NO checkpoint. train_timeout_minutes \
+          (${{ inputs.train_timeout_minutes }}) is shorter than the initial update burst, \
+          so nothing can be handed over. Raise it."
+                exit 1
+              fi
+              echo "::notice::Segment ${{ inputs.segment }} timed out; checkpoint saved, \
+          next segment continues."
+              ;;
+            crash)
+              echo "::error::Training CRASHED (exit ${{ steps.train.outputs.code }}). \
+          This is NOT a timeout -- see the Train step log."
+              exit 1
+              ;;
+            *)
+              echo "::error::Train produced no result (outer timeout or setup failure)."
+              exit 1
+              ;;
+          esac
+          [ -n "$D" ] || exit 0
           python3 - "$D/progress.csv" <<'PYEOF'
           import csv, sys
           rows=list(csv.DictReader(open(sys.argv[1])))

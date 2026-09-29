@@ -38,16 +38,47 @@ _COUNTERS = (
     "_successes_in_buffer",
 )
 
-# buffer arrays are sliced to _size: when the buffer has wrapped, _size ==
-# max_replay_buffer_size and the slice is the whole array, so this is always correct
-_BUFFER_ARRAYS = (
-    "_observations",
-    "_next_observations",
-    "_actions",
-    "_rewards",
-    "_terminals",
-    "_valid_starts",
+# Buffer contents are discovered, not hardcoded: SeqReplayBuffer and
+# SimpleReplayBuffer disagree on names (_next_observations vs _next_obs,
+# _valid_starts vs _timeouts/_episode_starts), so a fixed list breaks on whichever
+# arm was not tested. Arrays are sliced to _size -- when the buffer has wrapped,
+# _size == max_replay_buffer_size and the slice is the whole array.
+_BUFFER_SKIP_SCALARS = (
+    "_max_replay_buffer_size",
+    "_observation_dim",
+    "_action_dim",
+    "_sampled_seq_len",
+    "_sample_weight_baseline",
 )
+
+
+def _buffer_state(buf):
+    """(arrays sliced to _size, python-level bookkeeping)."""
+    size = buf._size
+    arrays, extras = {}, {}
+    for k, v in vars(buf).items():
+        if k in _BUFFER_SKIP_SCALARS:
+            continue
+        if isinstance(v, np.ndarray):
+            arrays[k] = v[:size].copy()
+        elif isinstance(v, (int, float, bool, list)):
+            extras[k] = v
+    return arrays, extras
+
+
+def _optimizers(obj):
+    """Discover optimizers by attribute name.
+
+    The policy classes disagree, so hardcoding names breaks silently on the arm
+    you did not test:
+        Policy_MLP           qf1_optim, qf2_optim, policy_optim
+        Policy_Separate_RNN  critic_optimizer, actor_optimizer
+        Policy_Shared_RNN    one joint `optimizer`
+        algo (SAC/SAC-d)     alpha_entropy_optim, when tuning entropy
+    """
+    return {
+        k: v for k, v in vars(obj).items() if isinstance(v, torch.optim.Optimizer)
+    }
 
 
 def _np_random_state(obj):
@@ -112,21 +143,19 @@ def save(learner, path, last_eval_num_iters=0):
     agent = learner.agent
     algo = agent.algo
     buf = learner.policy_storage
-    size = buf._size
 
     payload = {
         "format_version": FORMAT_VERSION,
         "seed": learner.seed,
         # --- networks and optimizers -------------------------------------
         "agent": agent.state_dict(),
-        "critic_optimizer": agent.critic_optimizer.state_dict(),
-        "actor_optimizer": agent.actor_optimizer.state_dict(),
+        "agent_optimizers": {k: o.state_dict() for k, o in _optimizers(agent).items()},
+        "algo_optimizers": {k: o.state_dict() for k, o in _optimizers(algo).items()},
         # --- SAC/SAC-discrete learned entropy coefficient ----------------
         "automatic_entropy_tuning": getattr(algo, "automatic_entropy_tuning", False),
         # --- replay buffer ------------------------------------------------
-        "buffer": {k: getattr(buf, k)[:size].copy() for k in _BUFFER_ARRAYS},
-        "buffer_top": buf._top,
-        "buffer_size": size,
+        "buffer": _buffer_state(buf)[0],
+        "buffer_extras": _buffer_state(buf)[1],
         # --- progress counters -------------------------------------------
         "counters": {k: getattr(learner, k) for k in _COUNTERS},
         "last_eval_num_iters": last_eval_num_iters,
@@ -149,7 +178,6 @@ def save(learner, path, last_eval_num_iters=0):
     }
     if payload["automatic_entropy_tuning"]:
         payload["log_alpha_entropy"] = algo.log_alpha_entropy.detach().cpu().clone()
-        payload["alpha_entropy_optim"] = algo.alpha_entropy_optim.state_dict()
 
     rows = _count_csv_rows(path)
     tmp = path + ".tmp"
@@ -182,21 +210,36 @@ def load(learner, path):
     agent = learner.agent
     algo = agent.algo
     agent.load_state_dict(payload["agent"])
-    agent.critic_optimizer.load_state_dict(payload["critic_optimizer"])
-    agent.actor_optimizer.load_state_dict(payload["actor_optimizer"])
+
+    for owner, key in ((agent, "agent_optimizers"), (algo, "algo_optimizers")):
+        found = _optimizers(owner)
+        saved = payload[key]
+        if set(found) != set(saved):
+            raise ValueError(
+                f"{key} mismatch: checkpoint has {sorted(saved)}, this agent has "
+                f"{sorted(found)}. The checkpoint was written by a different policy "
+                f"class."
+            )
+        for name, state in saved.items():
+            found[name].load_state_dict(state)
 
     if payload["automatic_entropy_tuning"]:
         with torch.no_grad():
             algo.log_alpha_entropy.copy_(payload["log_alpha_entropy"].to(ptu.device))
-        algo.alpha_entropy_optim.load_state_dict(payload["alpha_entropy_optim"])
         algo.alpha_entropy = algo.log_alpha_entropy.exp().detach().item()
 
     buf = learner.policy_storage
-    size = payload["buffer_size"]
+    live_arrays, _ = _buffer_state(buf)
+    if set(payload["buffer"]) != set(live_arrays):
+        raise ValueError(
+            f"buffer layout mismatch: checkpoint has {sorted(payload['buffer'])}, "
+            f"this buffer has {sorted(live_arrays)}. Different buffer class."
+        )
+    size = payload["buffer_extras"]["_size"]
     for k, arr in payload["buffer"].items():
         getattr(buf, k)[:size] = arr
-    buf._top = payload["buffer_top"]
-    buf._size = size
+    for k, v in payload["buffer_extras"].items():
+        setattr(buf, k, v)
 
     for k, v in payload["counters"].items():
         setattr(learner, k, v)
@@ -216,6 +259,6 @@ def load(learner, path):
     learner._restore_elapsed(payload["elapsed_seconds"])
     logger.log(
         f"resumed from {path}: env_steps {learner._n_env_steps_total}, "
-        f"rl_steps {learner._n_rl_update_steps_total}, buffer {size}"
+        f"rl_steps {learner._n_rl_update_steps_total}, buffer {buf._size}"
     )
     return payload["last_eval_num_iters"]
