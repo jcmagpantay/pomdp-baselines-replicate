@@ -82,11 +82,16 @@ jobs:
       - name: Train
         id: train
         if: steps.plan.outputs.state != 'done'
-        # The INNER `timeout` fires first so its exit code distinguishes a timeout
-        # (124: expected, hand over) from a crash (anything else: must fail loudly).
-        # Relying on the step timeout alone made a crashed run look identical to a
-        # timed-out one, and the job went green having trained nothing.
-        timeout-minutes: ${{ inputs.train_timeout_minutes + 10 }}
+        # The bound is the INNER `timeout` command, not a step timeout: its exit
+        # code distinguishes a timeout (124: expected, hand over) from a crash
+        # (anything else: must fail loudly). With only a step timeout, a crashed
+        # run looked identical to a timed-out one and the job went green having
+        # trained nothing.
+        #
+        # No step-level timeout-minutes here: GitHub expressions have NO arithmetic
+        # operators, so it cannot be derived from train_timeout_minutes. The
+        # job-level timeout-minutes: 350 is the outer safety net, and the default
+        # train_timeout_minutes of 320 leaves it 30 min of headroom.
         continue-on-error: true
         run: |
           set +e
