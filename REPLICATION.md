@@ -6,8 +6,11 @@ Many POMDPs* (Ni, Eysenbach & Salakhutdinov, ICML 2022) on macOS / Apple Silicon
 Everything here was established by running the code, not by reading about it. Numbers
 are labelled **measured** or **modelled**; don't cite a modelled number without saying so.
 
-**Status:** environment reproduced and training verified end to end. No completed
-training run yet. Resume support not yet implemented.
+**Status:** environment reproduced; resume/chaining implemented and verified;
+**the recurrent arm is calibrated against the published Pendulum-V curve**
+(-169.5 vs -170.8, 0.3 pooled se). CartPole-V also solved, 5/5 seeds at return
+200. See §6. The remaining gap is a valid oracle arm -- the shipped `mlp.yml` is
+not one.
 
 ---
 
@@ -168,7 +171,98 @@ hand-edit those directory names, the path is the metadata.**
 
 ---
 
-## 6. Compute budget
+## 6. Calibration results
+
+**Status: the recurrent arm is calibrated against published data. Replication is
+done for this project's purposes.**
+
+Three arms were run on Pendulum-V, 5 seeds each, on GitHub-hosted runners using
+the amd64 image. All reached the full 51,000 env steps.
+
+| arm | config | mean of last 5 evals | sd | h/seed |
+|---|---|---|---|---|
+| **recurrent** `sac_lstm` on the POMDP | `pendulum/v/rnn.yml --algo sac` | **-169.5** | 7.4 | 8.1 |
+| Markovian `mlp` on the POMDP | `pendulum/v/mlp.yml --env Pendulum-V-v0` | -1510.1 | 19.8 | 0.17 |
+| "oracle" `mlp` on the full state | `pendulum/v/mlp.yml` (as shipped) | -338.7 | 91.7 | 0.18 |
+
+Per-seed recurrent: -173.4, -178.2, -170.5, -169.5, -156.0.
+
+### Cross-validation against the published curve
+
+Reference data from `logs_txt.zip` (the working Drive link; the `data.zip` link in
+`docs/plot_curves.md` is **404**), at
+`logs_txt/pomdp/Pendulum/V/sac_lstm/len--1/bs-32/baseline-0.0/freq-1.0/oar/`.
+
+| | mean of last 5 evals | sd | n |
+|---|---|---|---|
+| ours | **-169.5** | 7.4 | 5 |
+| published, same variant | **-170.8** | 8.0 | 4 |
+| difference | **+1.3** | | |
+
+**0.3 pooled standard errors apart**, with overlapping seed ranges
+([-178, -156] vs [-183, -161]). Matched-step means track throughout, not only at
+the endpoint:
+
+| variant | n | 10k | 20k | 30k | 40k | 50k |
+|---|---|---|---|---|---|---|
+| ours, len-200 | 5 | -211 | -183 | -183 | -186 | -154 |
+| published, len-200 | 4 | -260 | -161 | -171 | -180 | -182 |
+| published, len-64 | 4 | -174 | -188 | -174 | -193 | -176 |
+| published, len-5 | 4 | -1158 | -1160 | -1064 | -1183 | -1063 |
+
+### The ordering test also passes
+
+The archive includes the paper's **Len** ablation, which is a stronger check than
+matching one curve: reproducing an ordering across variants is much harder to do
+by accident. Published ordering:
+
+    len-200 (-170.8)  >  len-64 (-173.4)  >>  len-5 (-1075.3)
+
+Our len-200 result sits where it should -- level with len-64, ~900 return above
+len-5. Note how sharp the cliff is: context length 5 fails almost entirely
+(-1075, barely above the Markovian -1510) while 64 and 200 are
+indistinguishable. Memory is not a dial on this environment; there is a
+threshold somewhere between 5 and 64 steps.
+
+### `mlp.yml` is NOT an oracle -- do not use it as one
+
+The recurrent arm **beats** that third arm by 169, which is impossible for a
+genuine upper bound on the same task with full state access. Two further tells:
+its sd is 91.7 (12x the recurrent arm's) and seed 73 collapsed to -520.
+
+`configs/pomdp/pendulum/v/mlp.yml` is an untuned Markovian baseline that happens
+to point at `Pendulum-v1` (fully observed) rather than `Pendulum-V-v0`. The
+authors did not use their own MLP runs as the oracle either -- `readme.md` says
+of Ant-P:
+
+> Oracle: we directly use Table 1 results (SAC w/ unstructured row) in
+> https://arxiv.org/abs/2005.05719 as it is well-tuned
+
+Consequences:
+
+- **`--oracle` is a no-op for `env_type: pomdp`.** It is only consumed in the
+  `meta`, `rmdp` and `generalize` branches of `init_env`; the `pomdp` branch just
+  calls `gym.make(env_name)`. Passing it only renames the log directory to
+  `oracle_*`, producing a mislabelled curve.
+- Any study whose dependent variable is *return difference vs. oracle* needs a
+  **tuned** full-state agent, demonstrated to be near-optimal. Pendulum's optimum
+  is around -150; this config reaches -339.
+
+### Calibration status by arm
+
+| arm | calibrated? |
+|---|---|
+| recurrent `sac_lstm` | **yes** -- -169.5 vs -170.8 published, plus the Len ordering |
+| Markovian `mlp` | runs correctly, but no published Pendulum reference exists |
+| oracle | **no** -- no valid oracle config exists here; must be built and tuned |
+
+VariBAD and VRM curves for Pendulum-V are also in the archive
+(`logs_txt/pomdp/Pendulum/V/{varibad,VRM}/`), so both recurrent-memory and
+latent-state arms can be calibrated on this one cheap environment. Their
+*implementations* are not on this branch -- only `scripts/constants.py` plot
+labels reference them; the code is on upstream's `all-methods` branch.
+
+## 7. Compute budget
 
 ### The three counters
 
@@ -234,6 +328,10 @@ the entire budget.
 ### Per-run durations
 
 Laptop figures are measured x read-from-config. GPU figures are **modelled**.
+**Native x86 is now measured** on GitHub runners: 322-821 ms/update for
+Pendulum-V (`sac_lstm`) and 601-1060 ms for CartPole-V -- a **2.5x spread between
+identical jobs**, so any estimate within ~2x of a session cap is a coin flip.
+Pendulum-V took 4.6-11.6 h/seed, against the 12-17 h this table predicted.
 
 | run | updates | laptop | native x86 | 1x A100 (modelled) |
 |---|---|---|---|---|
@@ -340,7 +438,7 @@ measurement. **To settle it:** run the per-update harness on any rented CUDA box
 
 ---
 
-## 7. Runners
+## 8. Runners
 
 ### Validity rule
 
@@ -415,10 +513,18 @@ many slots and this workload barely uses a card.
 
 ---
 
-## 8. TODO: resume support
+## 9. Resume support
 
-**Not implemented.** Required for Pendulum-V and anything larger, because every free tier
-caps sessions (6 h Actions, 12 h Kaggle).
+**Implemented and verified** (`utils/checkpoint.py`, `--resume <log_dir>`).
+Required for Pendulum-V and anything larger, because every free tier caps
+sessions (6 h Actions, 12 h Kaggle).
+
+Verified bitwise-exact on both arms: N iterations straight through vs. N/2,
+killed, resumed, finished produce `progress.csv` files identical across every
+non-wall-clock column. Resuming under a different `--seed` raises rather than
+quietly producing an invalid curve. In production all 5 Pendulum-V seeds reached
+exactly 51,000 steps across up to 3 chained CI segments, and the merged curve has
+no duplicate or non-monotonic steps.
 
 Current state: `policies/learner.py:904` `save_model` writes **only**
 `agent.state_dict()`, and `learner.py:400` gates it behind
@@ -469,11 +575,13 @@ stays valid.
 
 ---
 
-## 9. Provenance of the numbers
+## 10. Provenance of the numbers
 
 | claim | status |
 |---|---|
-| per-update timings in §6 | **measured** on this laptop (emulated amd64, torch 1.7.1, 1 thread) |
+| **calibration results in §6** | **measured**: 15 runs, 5 seeds x 3 arms, GitHub runners, amd64 image |
+| **published reference in §6** | **read** from `logs_txt.zip`, 4 seeds, same variant path |
+| per-update timings in §7 | **measured** on this laptop (emulated amd64, torch 1.7.1, 1 thread) |
 | update counts, episode lengths | **read** from configs and `envs/*/__init__.py` |
 | per-run laptop hours | measured x read |
 | phase breakdown of one update | **measured** |
@@ -482,7 +590,8 @@ stays valid.
 | 1.3% A100 utilization | arithmetic on a measured FLOP count |
 | **20–40x GPU speedup** | **modelled**, anchored on a README prose claim — weakest figure here |
 | 8–16 runs packed per card | **modelled**, untested |
-| native x86 ~= laptop/2 | **modelled** — extrapolated from a measured arm64-vs-emulated ratio |
+| native x86 speed | **measured** on GitHub runners: 322–821 ms/update (Pendulum-V), 601–1060 (CartPole-V) — a **2.5x spread between identical jobs** |
+| resume is bitwise-exact | **measured** on both the RNN and MLP arms (identical `progress.csv`) |
 | whole-repo 884 PFLOP / 6.1 years | cost model fitted to 5 measurements, **mean error 21%**, worst +36% |
 
 Two known biases: the `credit/` configs have CNN image encoders the FLOP model ignores
@@ -494,3 +603,17 @@ Measurements were also noisy: the same per-update figure came out 1577, 1628 and
 across repeats under background load. An early 63 h/seed estimate for Pendulum-V was
 **wrong by 2.8x** because the benchmark ran alongside a live training container. Measure
 on an idle machine.
+
+### Estimates that turned out wrong, and why
+
+Recorded because the same mistakes are easy to repeat.
+
+| estimate | reality | cause |
+|---|---|---|
+| Pendulum-V 63 h/seed | 4.6–11.6 h | benchmarked while a training container competed for cores |
+| Pendulum-V "fits one 6 h job" (4.5 h) | 6.5–14.7 h | extrapolated from one lucky fast runner; runner speed varies 2.5x |
+| GPU speedup up to 120x | revised to 20–40x | reasoned from A100 FLOP capacity, which is the one resource this workload cannot use |
+| `mlp.yml` is the oracle arm | it is an untuned baseline | assumed from the filename; never checked that the recurrent arm should not beat it |
+
+The pattern: every wrong number came from extrapolating a single observation
+instead of measuring the spread, or from reading a name instead of the code.
