@@ -181,9 +181,9 @@ the amd64 image. All reached the full 51,000 env steps.
 
 | arm | config | mean of last 5 evals | sd | h/seed |
 |---|---|---|---|---|
-| **recurrent** `sac_lstm` on the POMDP | `pendulum/v/rnn.yml --algo sac` | **-169.5** | 7.4 | 8.1 |
-| Markovian `mlp` on the POMDP | `pendulum/v/mlp.yml --env Pendulum-V-v0` | -1510.1 | 19.8 | 0.17 |
-| "oracle" `mlp` on the full state | `pendulum/v/mlp.yml` (as shipped) | -338.7 | 91.7 | 0.18 |
+| **recurrent** `sac_lstm` on the POMDP (treatment) | `pendulum/v/rnn.yml --algo sac` | **-169.5** | 7.4 | 8.1 |
+| Markovian `mlp` on the POMDP (**the paper's lower bound**) | `pendulum/v/mlp.yml --env Pendulum-V-v0` | -1510.1 | 19.8 | 0.17 |
+| Markovian `mlp` on the **MDP** (full state) | `pendulum/v/mlp.yml` (as shipped; see note) | -338.7 | 91.7 | 0.18 |
 
 Per-seed recurrent: -173.4, -178.2, -170.5, -169.5, -156.0.
 
@@ -224,29 +224,42 @@ len-5. Note how sharp the cliff is: context length 5 fails almost entirely
 indistinguishable. Memory is not a dial on this environment; there is a
 threshold somewhere between 5 and 64 steps.
 
-### `mlp.yml` is NOT an oracle -- do not use it as one
+### There is no oracle arm for `pomdp` environments -- by design
 
-The recurrent arm **beats** that third arm by 169, which is impossible for a
-genuine upper bound on the same task with full state access. Two further tells:
-its sd is 91.7 (12x the recurrent arm's) and seed 73 collapsed to -520.
+`mlp.yml` is the **Markovian lower bound**, not an oracle. `readme.md` is explicit:
 
-`configs/pomdp/pendulum/v/mlp.yml` is an untuned Markovian baseline that happens
-to point at `Pendulum-v1` (fully observed) rather than `Pendulum-V-v0`. The
-authors did not use their own MLP runs as the oracle either -- `readme.md` says
-of Ant-P:
-
-> Oracle: we directly use Table 1 results (SAC w/ unstructured row) in
+> \# Run Markovian
+> python policies/main.py --cfg configs/pomdp/ant_blt/p/mlp.yml --algo sac
+> \# Oracle: we directly use Table 1 results (SAC w/ unstructured row) in
 > https://arxiv.org/abs/2005.05719 as it is well-tuned
 
-Consequences:
+So the authors sourced their oracle **externally**, because their own MLP runs were
+not competitive. No oracle config exists in this repo for the pomdp subarea.
 
-- **`--oracle` is a no-op for `env_type: pomdp`.** It is only consumed in the
+Two related facts:
+
+- **`configs/pomdp/pendulum/v/mlp.yml` has an env_name anomaly.** 10 of 11
+  `/p/` and `/v/` mlp configs point at their POMDP env (`AntBLT-V-v0` etc.); only
+  this one points at the fully observed `Pendulum-v1`, with `#Pendulum-V-v0`
+  commented out on the same line. It looks like a leftover from a sanity check.
+  To run the intended Markovian baseline on Pendulum-V, pass
+  `--env Pendulum-V-v0`.
+- **`--oracle` is a no-op for `env_type: pomdp`.** It is consumed only in the
   `meta`, `rmdp` and `generalize` branches of `init_env`; the `pomdp` branch just
   calls `gym.make(env_name)`. Passing it only renames the log directory to
   `oracle_*`, producing a mislabelled curve.
-- Any study whose dependent variable is *return difference vs. oracle* needs a
-  **tuned** full-state agent, demonstrated to be near-optimal. Pendulum's optimum
-  is around -150; this config reaches -339.
+
+The third row of the table above is therefore **Markovian on the MDP** (full
+state), not an oracle. It is worth noting that it still lands *below* the
+recurrent POMDP agent (-338.7 vs -169.5, sd 91.7, one seed at -520): a tuned
+full-state SAC on Pendulum should reach roughly -150, so that arm is undertrained
+and is not usable as an upper bound either.
+
+**For any study whose dependent variable is a difference against an oracle:** you
+must build and tune one, and demonstrate it is near-optimal. Nothing here serves.
+A cheaper option is to define the oracle as *the same architecture on uncorrupted
+observations*, which isolates the manipulation and -- for a corruption study on
+Pendulum-V -- is already calibrated at -169.5.
 
 ### Calibration status by arm
 
@@ -254,7 +267,7 @@ Consequences:
 |---|---|
 | recurrent `sac_lstm` | **yes** -- -169.5 vs -170.8 published, plus the Len ordering |
 | Markovian `mlp` | runs correctly, but no published Pendulum reference exists |
-| oracle | **no** -- no valid oracle config exists here; must be built and tuned |
+| oracle | **n/a** -- the repo provides none for pomdp envs; the authors used external numbers. Must be built and tuned. |
 
 VariBAD and VRM curves for Pendulum-V are also in the archive
 (`logs_txt/pomdp/Pendulum/V/{varibad,VRM}/`), so both recurrent-memory and
@@ -613,7 +626,7 @@ Recorded because the same mistakes are easy to repeat.
 | Pendulum-V 63 h/seed | 4.6–11.6 h | benchmarked while a training container competed for cores |
 | Pendulum-V "fits one 6 h job" (4.5 h) | 6.5–14.7 h | extrapolated from one lucky fast runner; runner speed varies 2.5x |
 | GPU speedup up to 120x | revised to 20–40x | reasoned from A100 FLOP capacity, which is the one resource this workload cannot use |
-| `mlp.yml` is the oracle arm | it is an untuned baseline | assumed from the filename; never checked that the recurrent arm should not beat it |
+| called `mlp.yml` "the oracle" | it is the paper's **Markovian lower bound**; no oracle config exists for pomdp envs | inferred the role from one config's `env_name` instead of reading readme.md, which names the arms explicitly |
 
 The pattern: every wrong number came from extrapolating a single observation
 instead of measuring the spread, or from reading a name instead of the code.
